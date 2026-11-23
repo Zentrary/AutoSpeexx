@@ -57,23 +57,6 @@ def _load_audio_speed_multiplier(default=1.0):
         pass
     return default
 
-def _mock_log_missing_pages(answer_db):
-    if not isinstance(answer_db, dict):
-        return
-    chapter = answer_db.get("chapter")
-    if not isinstance(chapter, dict):
-        return
-    catalog = chapter.get("catalog")
-    if not isinstance(catalog, list):
-        return
-    for entry in catalog:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("pages_total") == 0:
-            title = entry.get("title", "Unknown")
-            cid = chapter.get("cid", "?")
-            print(f"[WARN] pages_total == 0 for chapter '{cid}' entry: {title}")
-
 GLOBAL_SPEED_MULTIPLIER = _load_speed_multiplier(5.0)
 _BASE_ACTION_SETTLE = 0.8
 _BASE_EXERCISE_STEP_PAUSE = 0.4
@@ -473,8 +456,15 @@ UNSUPPORTED_TYPES = {
     "type-intro": "introductory page",
 }
 
-SHOW_VERBOSE_STEPS = False
+SKIP_PRONUNCIATION = True
+SHOW_VERBOSE_STEPS = True
 USE_CACHE = False
+
+PRONUNCIATION_TYPES = {
+    "type-single-item-pronunciation",
+    "type-multi-item-pronunciation",
+    "type-multiple-item-pronunciation",
+}
 
 class BaseSolver:
     PASS_LINE = 51
@@ -505,7 +495,7 @@ class BaseSolver:
 
     def step(self, msg):
         if SHOW_VERBOSE_STEPS:
-            print(f"    >> {msg}")
+            print(f"    >> {msg}", flush=True)
         self.logger.info(f"STEP: {msg}")
 
     def _normalise_question_text(self, text):
@@ -574,6 +564,74 @@ class BaseSolver:
         except Exception:
             pass
         return "Unknown Question"
+
+    def _extract_chapter_page_info(self):
+        try:
+            return self.page.evaluate(r"""
+                () => {
+                    const out = {
+                        chapter_id: null,
+                        chapter_title: null,
+                        page_number: null,
+                        page_index: null,
+                        url: window.location.href,
+                    };
+                    try {
+                        const u = new URL(window.location.href);
+                        const q = u.searchParams;
+                        out.chapter_id =
+                            q.get('chapter') || q.get('chapterId') || q.get('cid') ||
+                            q.get('courseId') || q.get('course');
+                        out.page_number =
+                            q.get('page') || q.get('pageNumber') || q.get('pid') ||
+                            q.get('exerciseId');
+                        const m = u.pathname.match(/chapter[\/-](\d+)/i);
+                        if (m && !out.chapter_id) out.chapter_id = m[1];
+                        const p = u.pathname.match(/page[\/-](\d+)/i);
+                        if (p && !out.page_number) out.page_number = p[1];
+                    } catch (e) {}
+                    const titleSels = [
+                        '.chapter-title', '.course-title', '.courseware-title',
+                        'h1.exercise-header', '.instructions-text',
+                        '[class*="chapter-name"]', '[class*="course-name"]',
+                        '.breadcrumb .active', '.breadcrumb li:last-child',
+                        'header h1', 'header h2',
+                    ];
+                    for (const sel of titleSels) {
+                        const el = document.querySelector(sel);
+                        if (el && el.innerText && el.innerText.trim()) {
+                            out.chapter_title = el.innerText.trim().split('\n')[0].slice(0, 200);
+                            break;
+                        }
+                    }
+                    const pageSels = [
+                        '.pagination .active', '.page-number', '.exercise-page-number',
+                        '[class*="page-number"]', '[class*="page-counter"]',
+                        '.exercise-counter', '.progress-label',
+                    ];
+                    for (const sel of pageSels) {
+                        const el = document.querySelector(sel);
+                        if (el && el.innerText) {
+                            const t = el.innerText.trim();
+                            const m = t.match(/(\d+)\s*\/\s*(\d+)/);
+                            if (m) {
+                                out.page_index = parseInt(m[1], 10);
+                                out.page_total = parseInt(m[2], 10);
+                            } else if (/^\d+$/.test(t)) {
+                                out.page_index = parseInt(t, 10);
+                            }
+                            if (out.page_index != null && !out.page_number) {
+                                out.page_number = out.page_index;
+                            }
+                            break;
+                        }
+                    }
+                    return out;
+                }
+            """) or {}
+        except Exception as e:
+            self.logger.debug(f"[CHAPTER] extract failed: {e}")
+            return {}
 
     def _scroll_into_view(self, locator, timeout=1000):
         try:
@@ -1655,11 +1713,16 @@ class DragDropSolver(BaseSolver):
             self.step(f"Extracted {extracted_count} drag/drop answers")
             if self.answer_db is not None:
                 question_text = self._extract_question_text()
+                info = self._extract_chapter_page_info()
                 if getattr(self, "_extracted_answers_ok", True):
                     self.answer_db[question_text] = {
                         "type": "drag-drop",
                         "answers": answers,
                         "timestamp": datetime.now().isoformat(),
+                        "chapter_id": info.get("chapter_id"),
+                        "chapter_title": info.get("chapter_title"),
+                        "page_number": info.get("page_number"),
+                        "page_index": info.get("page_index"),
                     }
                     self.step(f"Saved drag/drop answers to DB")
                 else:
@@ -1797,10 +1860,15 @@ class AnswerSolver(BaseSolver):
         self.step(f"Extracted {len(correct_answers)} answers: {correct_answers}")
         if self.answer_db is not None:
             question_text = self._extract_question_text()
+            info = self._extract_chapter_page_info()
             self.answer_db[question_text] = {
                 "type": "answer",
                 "answers": correct_answers,
                 "timestamp": datetime.now().isoformat(),
+                "chapter_id": info.get("chapter_id"),
+                "chapter_title": info.get("chapter_title"),
+                "page_number": info.get("page_number"),
+                "page_index": info.get("page_index"),
             }
             self.step(f"Saved answers to DB")
         self.click_repeat(settle=ACTION_SETTLE_SECONDS)
@@ -2075,10 +2143,15 @@ class ScrambledSentenceSolver(BaseSolver):
             return self._solve_heuristic()
         if self.answer_db is not None:
             question_text = self._extract_question_text()
+            info = self._extract_chapter_page_info()
             self.answer_db[question_text] = {
                 "type": "scrambled-sentence",
                 "answers": target_sentences,
                 "timestamp": datetime.now().isoformat(),
+                "chapter_id": info.get("chapter_id"),
+                "chapter_title": info.get("chapter_title"),
+                "page_number": info.get("page_number"),
+                "page_index": info.get("page_index"),
             }
             self.step("Saved scrambled sentences to DB")
         reset_ok = self.click_repeat(settle=self.FAST_SETTLE)
@@ -2523,10 +2596,15 @@ class ScrambledTableSolver(BaseSolver):
         self.step(f"Extracted {len(correct_map)} items")
         if self.answer_db is not None:
             question_text = self._extract_question_text()
+            info = self._extract_chapter_page_info()
             self.answer_db[question_text] = {
                 "type": "scrambled-table",
                 "answers": correct_map,
                 "timestamp": datetime.now().isoformat(),
+                "chapter_id": info.get("chapter_id"),
+                "chapter_title": info.get("chapter_title"),
+                "page_number": info.get("page_number"),
+                "page_index": info.get("page_index"),
             }
             self.step(f"Saved scrambled table to DB")
         self.click_repeat(settle=0.3)
@@ -2727,10 +2805,15 @@ class SingleChoiceSolver(BaseSolver):
             return
         try:
             question_text = self._extract_question_text()
+            info = self._extract_chapter_page_info()
             entry = {
                 "type": "single-choice",
                 "answers": list(answers),
                 "timestamp": datetime.now().isoformat(),
+                "chapter_id": info.get("chapter_id"),
+                "chapter_title": info.get("chapter_title"),
+                "page_number": info.get("page_number"),
+                "page_index": info.get("page_index"),
             }
             if subtype:
                 entry["subtype"] = subtype
@@ -3874,27 +3957,19 @@ class MarkTextSolver(BaseSolver):
             result = self.page.evaluate(
                 """
                 () => {
-                    const allWords = document.querySelectorAll('.exercise-items .word');
-                    const groupPositions = [];
-                    const allPositions = [];
-                    const seenMarkTexts = new Set();
-                    allWords.forEach((w, i) => {
-                        const mt = w.closest('.mark-text');
-                        if (mt) {
-                            allPositions.push(i);
-                            if (!seenMarkTexts.has(mt)) {
-                                seenMarkTexts.add(mt);
-                                groupPositions.push(i);
-                            }
-                        }
+                    const allMarkTexts = document.querySelectorAll(
+                        '.exercise-items .mark-text'
+                    );
+                    const positions = [];
+                    allMarkTexts.forEach((mt, i) => {
+                        positions.push(i);
                     });
-                    return { groupPositions, allPositions };
+                    return positions;
                 }
             """
             )
-            group_positions = result.get("groupPositions", []) if result else []
-            all_positions = result.get("allPositions", []) if result else []
-            return group_positions, all_positions
+            positions = result if result else []
+            return positions, positions
         except Exception as e:
             self.logger.error(f"extract_correct_positions error: {e}")
             return [], []
@@ -3904,13 +3979,15 @@ class MarkTextSolver(BaseSolver):
             self.page.evaluate(
                 """
                 () => {
-                    const allWords = document.querySelectorAll('.exercise-items .word');
-                    allWords.forEach(w => {
-                        const cls = (w.className || '').toLowerCase();
+                    const allMarkTexts = document.querySelectorAll(
+                        '.exercise-items .mark-text'
+                    );
+                    allMarkTexts.forEach(mt => {
+                        const cls = (mt.className || '').toLowerCase();
                         if (cls.includes('selected') || cls.includes('marked') ||
                             cls.includes('highlight') || cls.includes('chosen') ||
                             cls.includes('active')) {
-                            try { w.click(); } catch(e) {}
+                            try { mt.click(); } catch(e) {}
                         }
                     });
                 }
@@ -3920,13 +3997,13 @@ class MarkTextSolver(BaseSolver):
             clicked = self.page.evaluate(
                 """
                 (positions) => {
-                    const allWords = Array.from(
-                        document.querySelectorAll('.exercise-items .word')
+                    const allMarkTexts = Array.from(
+                        document.querySelectorAll('.exercise-items .mark-text')
                     );
                     let clickedCount = 0;
                     positions.forEach(idx => {
-                        if (idx < allWords.length) {
-                            const el = allWords[idx];
+                        if (idx < allMarkTexts.length) {
+                            const el = allMarkTexts[idx];
                             try {
                                 el.scrollIntoView({ behavior: 'smooth', block: 'center' });
                                 el.click();
@@ -3939,7 +4016,7 @@ class MarkTextSolver(BaseSolver):
             """,
                 positions,
             )
-            self.step(f"Clicked {clicked} words by position")
+            self.step(f"Clicked {clicked} mark-text items by position")
         except Exception as e:
             self.logger.error(f"click_by_positions error: {e}")
 
@@ -4604,6 +4681,7 @@ class SpeexxBotCLI:
         self.answer_db = {}
         self.answer_records = []
         self.answer_page_contexts = {}
+        self.unassigned_answers = []
         self.chapter_catalog = []
         self._title_chapter_map = None
 
@@ -4619,6 +4697,31 @@ class SpeexxBotCLI:
             pass
         return value
 
+    def _normalize_chapter_catalog(self, entries):
+        catalog_by_title = {}
+        for item in entries if isinstance(entries, list) else []:
+            if not isinstance(item, dict):
+                continue
+            title = re.sub(r"\s+", " ", str(item.get("title") or "").strip())
+            key = title.casefold()
+            if not key:
+                continue
+            try:
+                pages_total = max(0, int(item.get("pages_total") or 0))
+            except (TypeError, ValueError):
+                pages_total = 0
+            current = catalog_by_title.get(key)
+            if current is None:
+                current = dict(item)
+                current["title"] = title
+                current["pages_total"] = pages_total
+                catalog_by_title[key] = current
+            else:
+                current["pages_total"] = max(
+                    int(current.get("pages_total") or 0), pages_total
+                )
+        return list(catalog_by_title.values())
+
     def _load_answer_db(self, chapter_name):
         if not chapter_name:
             return
@@ -4632,11 +4735,50 @@ class SpeexxBotCLI:
                 with open(self.answer_bank_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self.answer_page_contexts = {}
+                self.unassigned_answers = []
                 if isinstance(data, dict) and data.get("schema_version") == 2:
-                    self.answer_records = data.get("exercises", [])
-                    self.chapter_catalog = (
+                    self.answer_records = []
+                    self.chapter_catalog = self._normalize_chapter_catalog(
                         data.get("chapter", {}).get("catalog", []) or []
                     )
+                    unassigned_by_question = {}
+
+                    def collect_unassigned(record):
+                        if not isinstance(record, dict):
+                            return
+                        question = record.get("question")
+                        answer = record.get("answer")
+                        if not isinstance(question, str) or not question:
+                            return
+                        if not isinstance(answer, dict):
+                            return
+                        updated_at = record.get("updated_at") or answer.get(
+                            "timestamp", ""
+                        )
+                        current = unassigned_by_question.get(question)
+                        if current is None or str(updated_at) >= str(
+                            current.get("updated_at", "")
+                        ):
+                            unassigned_by_question[question] = {
+                                "question": question,
+                                "type": record.get("type")
+                                or answer.get("type", "unknown"),
+                                "answer": answer,
+                                "updated_at": updated_at,
+                            }
+
+                    for record in data.get("unassigned_answers", []) or []:
+                        collect_unassigned(record)
+
+                    for exercise in data.get("exercises", []) or []:
+                        if not isinstance(exercise, dict):
+                            continue
+                        if exercise.get("title") == "Imported answers (legacy)":
+                            for page in exercise.get("pages", []) or []:
+                                collect_unassigned(page)
+                            continue
+                        self.answer_records.append(exercise)
+                    self.unassigned_answers = list(unassigned_by_question.values())
                     self.answer_db = {}
                     for exercise in self.answer_records:
                         for page in exercise.get("pages", []):
@@ -4652,16 +4794,27 @@ class SpeexxBotCLI:
                                 answer = page.get("answer")
                                 if question and isinstance(answer, dict):
                                     self.answer_db[question] = answer
+                    for record in self.unassigned_answers:
+                        collect_unassigned(record)
+                    self.unassigned_answers = [
+                        record
+                        for question, record in unassigned_by_question.items()
+                        if question not in self.answer_db
+                    ]
+                    for record in self.unassigned_answers:
+                        self.answer_db[record["question"]] = record["answer"]
                     loaded_count = len(self.answer_db)
                     total_exercises = len(self.answer_records)
                     total_pages = sum(
                         len(x.get("pages", [])) for x in self.answer_records
                     )
                     self.logger.info(
-                        "[DB] Loaded structured database: %s exercises, %s pages, %s answers",
+                        "[DB] Loaded structured database: %s exercises, %s pages, "
+                        "%s answers, %s unassigned legacy answers",
                         total_exercises,
                         total_pages,
                         loaded_count,
+                        len(self.unassigned_answers),
                     )
                     self.validate_and_cleanup_answer_db()
                     if hasattr(self, "print_status"):
@@ -4675,6 +4828,7 @@ class SpeexxBotCLI:
                 else:
                     self.answer_records = []
                     self.chapter_catalog = []
+                    self.unassigned_answers = []
                     self.answer_db = data if isinstance(data, dict) else {}
                     self.logger.info(
                         "[DB] Loaded legacy database: %s answers (will migrate to schema v2)",
@@ -4684,6 +4838,7 @@ class SpeexxBotCLI:
                 self.answer_db = {}
                 self.answer_records = []
                 self.answer_page_contexts = {}
+                self.unassigned_answers = []
                 self.chapter_catalog = []
                 self.logger.info(f"[DB] New answer bank for {chapter_name}")
         except Exception as e:
@@ -4691,6 +4846,7 @@ class SpeexxBotCLI:
             self.answer_db = {}
             self.answer_records = []
             self.answer_page_contexts = {}
+            self.unassigned_answers = []
             self.chapter_catalog = []
 
     def _merge_legacy_answer_bank(self, safe_name):
@@ -4724,8 +4880,26 @@ class SpeexxBotCLI:
         }
         added_exercises = 0
         added_pages = 0
+        for record in data.get("unassigned_answers", []) or []:
+            if isinstance(record, dict):
+                self.unassigned_answers.append(dict(record))
+                added_pages += 1
         for legacy_exercise in data.get("exercises", []) or []:
             if not isinstance(legacy_exercise, dict):
+                continue
+            if legacy_exercise.get("title") == "Imported answers (legacy)":
+                for legacy_page in legacy_exercise.get("pages", []) or []:
+                    if not isinstance(legacy_page, dict):
+                        continue
+                    self.unassigned_answers.append(
+                        {
+                            "question": legacy_page.get("question"),
+                            "type": legacy_page.get("type"),
+                            "answer": legacy_page.get("answer"),
+                            "updated_at": legacy_page.get("updated_at"),
+                        }
+                    )
+                    added_pages += 1
                 continue
             key = norm_title(legacy_exercise.get("title"))
             target = by_title.get(key)
@@ -4814,9 +4988,14 @@ class SpeexxBotCLI:
         )
         try:
             now = datetime.now().isoformat()
-            exercises = (
-                self.answer_records if isinstance(self.answer_records, list) else []
-            )
+            exercises = [
+                exercise
+                for exercise in (
+                    self.answer_records if isinstance(self.answer_records, list) else []
+                )
+                if isinstance(exercise, dict)
+                and exercise.get("title") != "Imported answers (legacy)"
+            ]
 
             def get_exercise(title):
                 title = title or "Unknown exercise"
@@ -4831,27 +5010,56 @@ class SpeexxBotCLI:
                 exercises.append(exercise)
                 return exercise
 
-            legacy_exercise = next(
-                (e for e in exercises if e.get("title") == "Imported answers (legacy)"),
-                None,
-            )
-            if legacy_exercise is not None:
-                visited_questions = set(self.answer_page_contexts)
-                legacy_exercise["pages"] = [
-                    p
-                    for p in legacy_exercise.get("pages", [])
-                    if p.get("question") not in visited_questions
-                ]
+            unassigned_by_question = {}
+
+            def keep_unassigned(question, entry, answer_type=None, updated_at=None):
+                if not isinstance(question, str) or not question:
+                    return
+                if not isinstance(entry, dict):
+                    return
+                updated_at = updated_at or entry.get("timestamp") or now
+                current = unassigned_by_question.get(question)
+                if current is None or str(updated_at) >= str(
+                    current.get("updated_at", "")
+                ):
+                    unassigned_by_question[question] = {
+                        "question": question,
+                        "type": answer_type or entry.get("type", "unknown"),
+                        "answer": entry,
+                        "updated_at": updated_at,
+                    }
+
             for question, context in self.answer_page_contexts.items():
                 entry = self.answer_db.get(question)
                 if not isinstance(entry, dict):
+                    continue
+                try:
+                    page_number = int(context.get("page") or 0)
+                except (TypeError, ValueError):
+                    page_number = 0
+                if page_number < 1:
+                    exercise = get_exercise(context.get("title"))
+                    exercise["pages_total"] = max(
+                        int(exercise.get("pages_total") or 0),
+                        int(context.get("pages_total") or 0),
+                    )
+                    page_record = {
+                        "page": 0,
+                        "type": context.get("type", "unknown"),
+                        "question": question,
+                        "answer": entry,
+                        "updated_at": now,
+                    }
+                    exercise["pages"].append(page_record)
+                    self.logger.debug(
+                        f"[DB] Saved answer without page number to exercise '{context.get('title')}' (page 0)"
+                    )
                     continue
                 exercise = get_exercise(context.get("title"))
                 exercise["pages_total"] = max(
                     int(exercise.get("pages_total") or 0),
                     int(context.get("pages_total") or 0),
                 )
-                page_number = int(context.get("page") or 0)
                 page_record = next(
                     (
                         p
@@ -4885,33 +5093,30 @@ class SpeexxBotCLI:
                         int(catalog_item.get("pages_total") or 0),
                         int(context.get("pages_total") or 0),
                     )
+
             represented = {
                 p.get("question")
                 for exercise in exercises
-                for p in exercise.get("pages", [])
+                for p in (exercise.get("pages", []) or [])
+                if isinstance(p, dict) and p.get("question")
             }
-            legacy = get_exercise("Imported answers (legacy)")
+            for record in getattr(self, "unassigned_answers", []):
+                if isinstance(record, dict):
+                    keep_unassigned(
+                        record.get("question"),
+                        record.get("answer"),
+                        record.get("type"),
+                        record.get("updated_at"),
+                    )
             for question, entry in self.answer_db.items():
                 if question in represented or not isinstance(entry, dict):
                     continue
-                legacy["pages"].append(
-                    {
-                        "page": None,
-                        "type": entry.get("type", "unknown"),
-                        "question": question,
-                        "prompt": "",
-                        "answer": entry,
-                        "updated_at": now,
-                    }
-                )
-                represented.add(question)
-            if not legacy.get("pages"):
-                exercises[:] = [e for e in exercises if e is not legacy]
+                keep_unassigned(question, entry)
+            for question in represented:
+                unassigned_by_question.pop(question, None)
+
             exercises.sort(
-                key=lambda e: (
-                    e.get("title") == "Imported answers (legacy)",
-                    e.get("title", ""),
-                )
+                key=lambda exercise: exercise.get("title", "")
             )
             if not self.chapter_catalog:
                 self.chapter_catalog = [
@@ -4920,12 +5125,16 @@ class SpeexxBotCLI:
                         "pages_total": e.get("pages_total", 0),
                     }
                     for e in exercises
-                    if e.get("title") != "Imported answers (legacy)"
                 ]
+            self.chapter_catalog = self._normalize_chapter_catalog(
+                self.chapter_catalog
+            )
             total_pages = sum(
                 int(item.get("pages_total") or 0) for item in self.chapter_catalog
             )
-            answered_pages = sum(len(e.get("pages", [])) for e in exercises)
+            answered_pages = sum(
+                len(e.get("pages", []) or []) for e in exercises
+            ) + len(unassigned_by_question)
             known_exercises = len(self.chapter_catalog)
             payload = {
                 "schema_version": 2,
@@ -4941,16 +5150,20 @@ class SpeexxBotCLI:
                     "catalog": self.chapter_catalog,
                 },
                 "exercises": exercises,
+                "unassigned_answers": list(unassigned_by_question.values()),
             }
             with open(self.answer_bank_file, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             self.answer_records = exercises
+            self.unassigned_answers = list(unassigned_by_question.values())
             summary = payload["chapter"]["summary"]
             self.logger.info(
-                "[DB] Saved structured database: %s exercises, %s pages, %s answered pages",
+                "[DB] Saved structured database: %s exercises, %s pages, "
+                "%s answered pages, %s unassigned legacy answers",
                 summary["exercises"],
                 summary["pages"],
                 summary["answered_pages"],
+                len(self.unassigned_answers),
             )
         except Exception as e:
             self.logger.error(f"[DB] Save failed: {e}")
@@ -4977,6 +5190,129 @@ class SpeexxBotCLI:
             }
         except Exception as e:
             self.logger.debug(f"[DB] Page context capture failed: {e}")
+
+    def repair_answer_db_file(self, filepath=None):
+        import shutil
+        from difflib import SequenceMatcher
+
+        if filepath is None:
+            filepath = self.answer_bank_file
+        if not filepath or not os.path.exists(filepath):
+            self.logger.warning(f"[REPAIR] File not found: {filepath}")
+            return False
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, dict):
+                self.logger.warning("[REPAIR] Invalid JSON structure (not a dict)")
+                return False
+
+            exercises = data.get("exercises", [])
+            unassigned = data.get("unassigned_answers", [])
+            if not isinstance(exercises, list) or not isinstance(unassigned, list):
+                self.logger.warning("[REPAIR] Invalid exercises or unassigned_answers structure")
+                return False
+
+            if not unassigned:
+                self.logger.info("[REPAIR] No unassigned answers to repair")
+                return True
+
+            exercise_by_title = {}
+            for ex in exercises:
+                if isinstance(ex, dict) and ex.get("title"):
+                    exercise_by_title[ex["title"]] = ex
+
+            def find_best_exercise(question_text):
+                if not question_text:
+                    return None
+
+                parts = [p.strip() for p in question_text.split("|")]
+                candidates = []
+                if len(parts) >= 2:
+                    candidates.append(parts[1])
+                candidates.append(question_text)
+
+                best_ex = None
+                best_score = 0.0
+                for candidate in candidates:
+                    if not candidate:
+                        continue
+                    c_lower = candidate.lower()
+                    for title, ex in exercise_by_title.items():
+                        if not title:
+                            continue
+                        t_lower = title.lower()
+                        if t_lower in c_lower or c_lower in t_lower:
+                            score = SequenceMatcher(None, c_lower, t_lower).ratio()
+                            if score > best_score:
+                                best_score = score
+                                best_ex = ex
+                    if best_score < 0.6:
+                        for title, ex in exercise_by_title.items():
+                            if not title:
+                                continue
+                            score = SequenceMatcher(None, c_lower, title.lower()).ratio()
+                            if score > best_score:
+                                best_score = score
+                                best_ex = ex
+                return best_ex if best_score >= 0.5 else None
+
+            moved = 0
+            remaining = []
+            now = datetime.now().isoformat()
+
+            for item in unassigned:
+                if not isinstance(item, dict):
+                    remaining.append(item)
+                    continue
+                question = item.get("question", "")
+                answer = item.get("answer", {})
+                answer_type = item.get("type", "unknown")
+                updated_at = item.get("updated_at", now)
+
+                ex = find_best_exercise(question)
+                if ex is None:
+                    remaining.append(item)
+                    continue
+
+                pages = ex.setdefault("pages", [])
+                page_record = {
+                    "page": 0,
+                    "type": answer_type,
+                    "question": question,
+                    "answer": answer,
+                    "updated_at": updated_at,
+                }
+                pages.append(page_record)
+                pages_total = ex.get("pages_total", 0) or 0
+                ex["pages_total"] = max(int(pages_total), len(pages))
+                moved += 1
+
+            data["unassigned_answers"] = remaining
+            data["chapter"] = data.get("chapter", {})
+            data["chapter"]["summary"] = data["chapter"].get("summary", {})
+            data["chapter"]["summary"]["answered_pages"] = sum(
+                len(ex.get("pages", [])) for ex in exercises if isinstance(ex, dict)
+            )
+
+            backup_path = filepath + ".repair_bak"
+            if os.path.exists(filepath):
+                shutil.copy2(filepath, backup_path)
+
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            self.logger.info(
+                f"[REPAIR] Moved {moved} unassigned answers to exercises, "
+                f"{len(remaining)} still unassigned. Backup saved to {backup_path}"
+            )
+            return True
+
+        except Exception as e:
+            self.logger.error(f"[REPAIR] Error: {e}")
+            return False
 
     def _ensure_all_exercises_visible(self):
         try:
@@ -5055,7 +5391,12 @@ class SpeexxBotCLI:
 
     def _save_answer_db(self):
         try:
-            if self.answer_records and self.current_chapter_name:
+            if self.current_chapter_name and (
+                self.answer_records
+                or self.unassigned_answers
+                or self.chapter_catalog
+                or self.answer_page_contexts
+            ):
                 self._save_answer_db_per_chapter(self.current_chapter_name)
                 return
             if self.answer_bank_file:
@@ -5118,7 +5459,7 @@ class SpeexxBotCLI:
             "DB": f"{Fore.BLUE}[ DB ]{Style.RESET_ALL}",
         }
         prefix = prefix_map.get(t, "[?]")
-        print(f"  {prefix} {msg}")
+        print(f"  {prefix} {msg}", flush=True)
         self.logger.info(f"{t}: {msg}")
 
     def _cleanup_browser(self):
@@ -6069,25 +6410,24 @@ class SpeexxBotCLI:
                         f"  [{i:<3}]| {td:<33}| {date:<13}| "
                         f"{t_spent:<9}| {score_color}{score:<7}{Style.RESET_ALL}| {rb:<10}"
                     )
-            known_pages = {
-                item.get("title"): item.get("pages_total", 0)
-                for item in self.chapter_catalog
-                if isinstance(item, dict)
-            }
             existing_by_key = {
-                (item.get("title") or "").strip().casefold(): item
+                re.sub(r"\s+", " ", (item.get("title") or "").strip()).casefold(): item
                 for item in self.chapter_catalog
                 if isinstance(item, dict)
             }
             merged_catalog = []
             seen_keys = set()
             for title, _ in exercises:
-                key = (title or "").strip().casefold()
+                title = re.sub(r"\s+", " ", (title or "").strip())
+                key = title.casefold()
+                if not key or key in seen_keys:
+                    continue
                 seen_keys.add(key)
+                previous = existing_by_key.get(key, {})
                 merged_catalog.append(
                     {
                         "title": title,
-                        "pages_total": int(known_pages.get(title, 0) or 0),
+                        "pages_total": int(previous.get("pages_total") or 0),
                     }
                 )
             for key, item in existing_by_key.items():
@@ -6098,7 +6438,7 @@ class SpeexxBotCLI:
                             "pages_total": int(item.get("pages_total") or 0),
                         }
                     )
-            self.chapter_catalog = merged_catalog
+            self.chapter_catalog = self._normalize_chapter_catalog(merged_catalog)
             self._title_chapter_map = None
             self.logger.info(
                 "[DB] Chapter catalogue: %s exercises (page totals fill as exercises are opened)",
@@ -6288,23 +6628,69 @@ class SpeexxBotCLI:
             print(json.dumps(answer.get("answers"), ensure_ascii=False, indent=4))
         self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
 
-    def get_total_exercises(self, retries=4, wait_seconds=1.5):
+    def _page_number_from_nav_item(self, item):
+        try:
+            ordinal = (item.get_attribute("data-ordinal") or "").strip()
+            if ordinal.isdigit():
+                return int(ordinal)
+            classes = (item.get_attribute("class") or "").split()
+            if "intro-icon" in classes:
+                return 1
+            square = item.locator(":scope > .exercise-square").first
+            if square.count() > 0:
+                text = (square.inner_text() or "").strip()
+                if text.isdigit():
+                    return int(text)
+        except Exception as e:
+            self.logger.debug(f"[TOTAL] Could not read page ordinal: {e}")
+        return None
+
+    def _extract_page_numbers(self, items):
+        page_numbers = set()
+        for item in items:
+            try:
+                if not item.is_visible(timeout=300):
+                    continue
+                page_number = self._page_number_from_nav_item(item)
+                if page_number is not None:
+                    page_numbers.add(page_number)
+            except Exception as e:
+                self.logger.debug(f"[TOTAL] Could not inspect navigation item: {e}")
+        return sorted(page_numbers)
+
+    def get_total_exercises(self, retries=8, wait_seconds=1.0):
         selectors = [
-            ".exercises-large-navigation.visible-lg li",
-            ".exercises-large-navigation.visible-md li",
-            ".exercises-large-navigation.visible-sm li",
+            "ul.exercises-large-navigation.visible-lg",
+            "ul.exercises-large-navigation.visible-md",
+            "ul.exercises-large-navigation.visible-sm",
         ]
+        previous_signature = None
+        stable_reads = 0
         for attempt in range(retries):
             try:
                 dismiss_audio_setup_modal(self.page, self.logger)
                 for sel in selectors:
-                    items = self.page.locator(sel).all()
-                    if items:
+                    nav = self.page.locator(sel).first
+                    if nav.count() == 0 or not nav.is_visible(timeout=300):
+                        continue
+                    items = nav.locator(":scope > li.exercise-icon").all()
+                    page_numbers = self._extract_page_numbers(items)
+                    if not page_numbers:
+                        continue
+                    signature = (self.page.url, tuple(page_numbers))
+                    if signature == previous_signature:
+                        stable_reads += 1
+                    else:
+                        previous_signature = signature
+                        stable_reads = 1
+                    if stable_reads >= 2:
+                        total = max(page_numbers)
                         self.logger.info(
-                            f"[TOTAL] Found {len(items)} pages via {sel} "
-                            f"(attempt {attempt+1}/{retries})"
+                            f"[TOTAL] Stable navigation ordinals {page_numbers}; "
+                            f"total={total} via {sel}"
                         )
-                        return len(items)
+                        return total
+                    break
             except Exception as e:
                 self.logger.debug(f"[TOTAL] attempt {attempt+1} error: {e}")
             if attempt < retries - 1:
@@ -6312,12 +6698,12 @@ class SpeexxBotCLI:
         try:
             ex = self.page.locator(".exercise, .video").first
             if ex.count() > 0 and ex.is_visible(timeout=1000):
-                self.logger.info(
-                    "[TOTAL] No navigation found but on an exercise page — assuming 1 page"
+                self.logger.warning(
+                    "[TOTAL] Exercise content is visible but navigation is missing; "
+                    "refusing to assume a one-page packet"
                 )
-                return 1
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"[TOTAL] Could not verify exercise content: {e}")
         self.logger.warning(
             f"[TOTAL] Cannot find exercise navigation after {retries} attempts"
         )
@@ -6326,15 +6712,18 @@ class SpeexxBotCLI:
     def navigate_to_exercise_page(self, num):
         try:
             dismiss_audio_setup_modal(self.page, self.logger)
-            items = self.page.locator(".exercises-large-navigation.visible-lg li").all()
-            if not items:
-                items = self.page.locator(
-                    ".exercises-large-navigation.visible-md li"
-                ).all()
-            if not items:
-                items = self.page.locator(
-                    ".exercises-large-navigation.visible-sm li"
-                ).all()
+            nav_selectors = [
+                "ul.exercises-large-navigation.visible-lg",
+                "ul.exercises-large-navigation.visible-md",
+                "ul.exercises-large-navigation.visible-sm",
+            ]
+            items = []
+            for selector in nav_selectors:
+                nav = self.page.locator(selector).first
+                if nav.count() > 0 and nav.is_visible(timeout=300):
+                    items = nav.locator(":scope > li.exercise-icon").all()
+                    if items:
+                        break
             if not items:
                 if num == 1:
                     try:
@@ -6345,9 +6734,21 @@ class SpeexxBotCLI:
                     except Exception:
                         return False
                 return False
-            if not (1 <= num <= len(items)):
+            target = next(
+                (
+                    item
+                    for item in items
+                    if self._page_number_from_nav_item(item) == num
+                ),
+                None,
+            )
+            if target is None:
+                self.logger.warning(
+                    f"[NAV] Page {num} is not present in the exercise navigation; "
+                    f"available pages: "
+                    f"{self._extract_page_numbers(items)}"
+                )
                 return False
-            target = items[num - 1]
             try:
                 target.scroll_into_view_if_needed(timeout=1500)
             except Exception:
@@ -6711,6 +7112,52 @@ class SpeexxBotCLI:
             self.logger.error(f"[SKIP] Error: {e}")
             return False
 
+    def _skip_pronunciation_to_last_page(self, current_page, total_pages):
+        try:
+            if total_pages > 1 and current_page < total_pages:
+                self.logger.info(
+                    f"[PRON-SKIP] Jumping to last page {total_pages}/{total_pages}"
+                )
+                if not self.navigate_to_exercise_page(total_pages):
+                    self.logger.error(
+                        f"[PRON-SKIP] Could not navigate to last page "
+                        f"{total_pages}/{total_pages}"
+                    )
+                    return False
+                time.sleep(1.0)
+                dismiss_audio_setup_modal(self.page, self.logger)
+
+            next_btn = self.page.locator(
+                "button.action-exercise-button.next"
+            ).first
+            if next_btn.count() == 0 or not next_btn.is_visible(timeout=3000):
+                self.logger.error("[PRON-SKIP] Next button not found on last page")
+                return False
+            time.sleep(0.3 / GLOBAL_SPEED_MULTIPLIER)
+            try:
+                next_btn.click(timeout=5000, force=True)
+            except Exception as click_error:
+                self.logger.warning(
+                    "[PRON-SKIP] Playwright Next click failed; retrying DOM click: "
+                    f"{str(click_error)[:160]}"
+                )
+                next_btn.evaluate("el => el.click()")
+            self.logger.info("[PRON-SKIP] Clicked Next on last page")
+            time.sleep(1.5 / GLOBAL_SPEED_MULTIPLIER)
+            modal_ready = self.wait_for_completion_modal(timeout=10)
+            if not modal_ready:
+                self.logger.warning(
+                    "[PRON-SKIP] Completion modal not detected after clicking Next"
+                )
+                return False
+            self.logger.info(
+                "[PRON-SKIP] Completion modal ready; handing Continue to packet flow"
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"[PRON-SKIP] Error: {e}")
+            return False
+
     def _parse_elapsed_seconds(self, elapsed):
         if not elapsed or elapsed == "N/A":
             return 0.0
@@ -7013,7 +7460,15 @@ class SpeexxBotCLI:
             PASS_LINE = 51
             MAX_TIME_PER_PAGE = 300
             for i in pages_to_solve:
-                self.navigate_to_exercise_page(i)
+                if not self.navigate_to_exercise_page(i):
+                    self.print_status(
+                        "ERROR",
+                        f"ไม่พบหน้าที่ {i}/{total_pages} ในแถบนำทาง — "
+                        "หยุดเพื่อไม่ให้ประมวลผลหน้าเดิมซ้ำ",
+                    )
+                    results.append((i, "FAILED", 0, "N/A"))
+                    all_success = False
+                    break
                 time.sleep(1.0)
                 dismiss_audio_setup_modal(self.page, self.logger)
                 et = engine.detect_type()
@@ -7043,6 +7498,16 @@ class SpeexxBotCLI:
                     self._try_skip_to_next_page()
                     time.sleep(0.3)
                     continue
+
+                if SKIP_PRONUNCIATION and et in PRONUNCIATION_TYPES:
+                    self.print_status("SKIP", "ข้ามแบบฝึกหัดประเภทเสียง")
+                    if not self._skip_pronunciation_to_last_page(i, total_pages):
+                        results.append((i, "FAILED", 0, "N/A"))
+                        all_success = False
+                        break
+                    results.append((i, "SKIPPED", 0, "N/A"))
+                    has_skipped = True
+                    break
                 solver = engine.get_solver(et, force_solve=effective_force)
                 if not solver:
                     snapshot = self._capture_diagnostic_snapshot(title, i, et)
@@ -7368,10 +7833,7 @@ class SpeexxBotCLI:
                             self.page.wait_for_selector(
                                 ".exercise, .video", state="visible", timeout=10000
                             )
-                            new_total = self.get_total_exercises(
-                                retries=2 if auto_continue else 4,
-                                wait_seconds=0.75 if auto_continue else 1.5,
-                            )
+                            new_total = self.get_total_exercises()
                             new_title = self.get_current_exercise_title()
                             if auto_continue:
                                 known_chapters = self._known_title_chapters().get(
@@ -7553,14 +8015,25 @@ class SpeexxBotCLI:
         self, current_title, status, score, elapsed, seen_titles, continuation_depth
     ):
         try:
+            rows = []
             if self.current_chapter_cid:
                 rows = self._load_chapter_rows(self.current_chapter_cid)
                 if not rows:
-                    self.print_status(
-                        "ERROR",
-                        f"โหลดรายการแบบฝึกหัดของบท {self.current_chapter_name} ไม่สำเร็จ — หยุดเพื่อไม่ให้ข้าม level",
+                    self.logger.warning(
+                        f"[CONTINUE] _load_chapter_rows returned empty for "
+                        f"{self.current_chapter_name} — falling back to direct table read"
                     )
-                    return (status, score, elapsed)
+                    if (
+                        "/results" not in self.page.url.lower()
+                        or "/articles/list" in self.page.url.lower()
+                    ):
+                        if not self.navigate_to_results():
+                            return (status, score, elapsed)
+                    self.page.locator("tbody tr.clickable").first.wait_for(
+                        state="visible", timeout=15000
+                    )
+                    self._ensure_all_exercises_visible()
+                    rows = self.page.locator("tbody tr.clickable").all()
             else:
                 if (
                     "/results" not in self.page.url.lower()
@@ -7594,7 +8067,7 @@ class SpeexxBotCLI:
                 ".exercise, .video", state="visible", timeout=15000
             )
             self.current_packet_id = self._url_packet_id() or self.current_packet_id
-            next_total = self.get_total_exercises(retries=2, wait_seconds=0.75)
+            next_total = self.get_total_exercises()
             if next_total == 0:
                 self.print_status(
                     "ERROR", f"เปิด {next_title} แล้ว แต่ยังไม่พบหน้าแบบฝึกหัด"
@@ -7776,7 +8249,8 @@ class SpeexxBotCLI:
             print(f"  {Fore.CYAN}--- {self.T['dashboard_menu']} ---{Style.RESET_ALL}\n")
             print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} {self.T['opt_select_chapter']}")
             print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} {self.T['opt_logout']}")
-            print(f"  {Fore.WHITE}[3]{Style.RESET_ALL} {self.T['opt_exit']}")
+            print(f"  {Fore.WHITE}[3]{Style.RESET_ALL} {self.T['opt_repair_db']}")
+            print(f"  {Fore.WHITE}[4]{Style.RESET_ALL} {self.T['opt_exit']}")
             try:
                 c = self._input(f"\n  {Fore.CYAN}[>] Select: {Style.RESET_ALL}").strip()
                 if c == "":
@@ -7789,6 +8263,9 @@ class SpeexxBotCLI:
                     self._cleanup_browser()
                     return
                 elif c == "3":
+                    self.repair_answer_db_file()
+                    self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+                elif c == "4":
                     self.shutdown()
                 else:
                     self.print_status("ERROR", self.T["invalid_choice"])
@@ -7812,6 +8289,24 @@ class SpeexxBotCLI:
             except Exception as e:
                 self.print_status("ERROR", f"Critical error: {str(e)}")
                 self.shutdown()
+
+def repair_answers_json(filepath=None):
+
+    import logging
+    import os
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger("repair_answers_json")
+
+    class _DummyBot:
+        def __init__(self, fp):
+            self.logger = logger
+            self.answer_bank_file = fp
+
+    if filepath is None:
+        filepath = os.path.join("solve data", "answers_Excellence.json")
+
+    bot = _DummyBot(filepath)
+    return bot.repair_answer_db_file(filepath)
 
 if __name__ == "__main__":
     bot = SpeexxBotCLI()
